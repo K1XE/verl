@@ -957,6 +957,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     self.config.ref.use_prefix_grouper = use_prefix_grouper
             self.ref_policy = DataParallelPPOActor(config=self.config.ref, actor_module=self.ref_module_fsdp)
 
+            # Inject ref_module into actor for analytic_kl loss (ref model is built after actor)
+            if self._is_actor and getattr(self.config.actor, "kl_loss_type", "") == "analytic_kl":
+                self.actor.ref_module = self.ref_module_fsdp
+
         if self._is_actor:
             self.flops_counter = FlopsCounter(self.actor_model_config)
             self.checkpoint_manager = FSDPCheckpointManager(

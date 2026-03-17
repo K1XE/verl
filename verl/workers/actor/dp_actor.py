@@ -27,7 +27,7 @@ from torch.distributed.tensor import DTensor
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty, topk_analytic_kl
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -55,11 +55,18 @@ class DataParallelPPOActor(BasePPOActor):
         actor_optimizer (torch.optim.Optimizer, optional): Actor optimizer. Defaults to None.
     """
 
-    def __init__(self, config: ActorConfig, actor_module: nn.Module, actor_optimizer: torch.optim.Optimizer = None):
+    def __init__(
+        self,
+        config: ActorConfig,
+        actor_module: nn.Module,
+        actor_optimizer: torch.optim.Optimizer = None,
+        ref_module: nn.Module = None,
+    ):
         """When optimizer is None, it is Reference Policy"""
         super().__init__(config)
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
+        self.ref_module = ref_module  # used for analytic_kl loss type
         role = "Ref" if actor_optimizer is None else "Actor"
 
         self.use_remove_padding = self.config.get("use_remove_padding", False)
@@ -386,6 +393,9 @@ class DataParallelPPOActor(BasePPOActor):
                 outputs["entropys"] = entropy
             if calculate_sum_pi_squared:
                 outputs["sum_pi_squared"] = sum_pi_squared
+            # Retain response-segment logits for analytic_kl (non-fused path only)
+            if not self.use_fused_kernels and getattr(self.config, "kl_loss_type", "") == "analytic_kl":
+                outputs["logits"] = logits  # (bsz, response_length, V), temperature already applied
             return outputs
 
     def _optimizer_step(self):
@@ -645,11 +655,36 @@ class DataParallelPPOActor(BasePPOActor):
                             policy_loss -= entropy_agg * entropy_coeff
 
                     if self.config.use_kl_loss:
-                        ref_log_prob = model_inputs["ref_log_prob"]
-                        # compute kl loss
-                        kld = kl_penalty(
-                            logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
-                        )
+                        if getattr(self.config, "kl_loss_type", "") == "analytic_kl":
+                            assert self.ref_module is not None, (
+                                "kl_loss_type='analytic_kl' requires ref_module to be injected into "
+                                "DataParallelPPOActor. Set kl_loss_type='analytic_kl' only when the worker "
+                                "has access to a ref model (ActorRolloutRefWorker with _is_ref=True)."
+                            )
+                            assert "logits" in outputs, (
+                                "analytic_kl requires logits from _forward_micro_batch. "
+                                "use_fused_kernels=True is not supported with analytic_kl."
+                            )
+                            k_val = getattr(self.config, "topk_kl_k", 256) or None  # 0 → None → full-vocab
+                            kl_mode = getattr(self.config, "topk_kl_mode", "reverse_kl")
+                            jsd_beta = getattr(self.config, "topk_kl_jsd_beta", 0.5)
+                            response_length = response_mask.shape[-1]
+                            with torch.no_grad():
+                                ref_out = self.ref_module(
+                                    input_ids=model_inputs["input_ids"],
+                                    attention_mask=model_inputs["attention_mask"],
+                                    position_ids=model_inputs.get("position_ids"),
+                                    use_cache=False,
+                                )
+                                ref_logits = ref_out.logits[:, -response_length - 1 : -1, :]
+                            kld = topk_analytic_kl(
+                                outputs["logits"], ref_logits, k=k_val, mode=kl_mode, jsd_beta=jsd_beta
+                            )
+                        else:
+                            ref_log_prob = model_inputs["ref_log_prob"]
+                            kld = kl_penalty(
+                                logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
+                            )
                         kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
                         policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
