@@ -123,6 +123,56 @@ python -c "from verl.trainer.ppo.core_algos import topk_analytic_kl; print('OK:'
 
 ---
 
+## rllm 用户附加 patch（必读）
+
+> 如果你用的是 [rllm](https://github.com/rllm-org/rllm)，完成上面的 wget 之后还需要手动 patch 一处代码。
+
+### 原因
+
+rllm 的 `AgentPPOTrainer` 继承自 `RayPPOTrainer`，但训练主循环是自己的 `fit_agent()` 方法，
+**不调用** `ray_trainer.py` 的 `fit()`。
+上面 wget 的 `ray_trainer.py` 里的 OEL 预算块因此永远不会被触发，
+`update_policy` 里会找不到 `kl_topk_indices` 和 `ref_log_prob_topk`，导致 analytic_kl 静默失效或报错。
+
+### 找到插入位置
+
+在你的 `agent_ppo_trainer.py`（rllm 仓库）里搜索 `compute_ref_log_prob`，找到这一段：
+
+```python
+if self.use_reference_policy:
+    # compute reference log_prob
+    with marked_timer("ref", timing_raw):
+        ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+        batch = batch.union(ref_log_prob)
+```
+
+### 在其正后方插入以下代码
+
+（缩进与上面的 `if self.use_reference_policy:` 对齐）
+
+```python
+# OEL 预算：analytic_kl 专用，每步 1 次 actor+ref forward
+# 将 update_policy 内的 K×M 次 ref forward 压缩为此处 1 次
+actor_cfg = self.config.actor_rollout_ref.actor
+if (
+    getattr(actor_cfg, "use_kl_loss", False)
+    and getattr(actor_cfg, "kl_loss_type", "") == "analytic_kl"
+    and getattr(actor_cfg, "topk_kl_k", 256) > 0
+    and self.use_reference_policy
+):
+    with marked_timer("analytic_kl_topk_precompute", timing_raw):
+        topk_idx_proto = self.actor_wg.compute_kl_topk_indices(batch)
+        batch = batch.union(topk_idx_proto)
+        ref_topk_proto = self.ref_policy_wg.compute_ref_log_prob_topk(batch)
+        batch = batch.union(ref_topk_proto)
+```
+
+> **注意**：`self.actor_wg` 是 rllm 里 actor worker group 的名字。
+> 如果你的版本命名不同（如 `self.actor_rollout_wg`），替换掉。
+> 如果你的版本没有 `marked_timer`，去掉 `with marked_timer(...):` 那行，只保留内部 3 行。
+
+---
+
 ## 配置方法
 
 在训练脚本或 yaml 的 `actor_rollout_ref.actor` 节中添加：
@@ -223,18 +273,63 @@ actor_rollout_ref:
 理论上可用，但目前尚未在 variable-length / remove_padding 场景中验证。
 首次使用建议关闭 `remove_padding`，验证后再开启。
 
-### 4. 显存说明（OEL 预算路径，top-k=256）
+### 4. 显存说明（与原始 k3 的详细对比）
 
-OEL 预算阶段临时存储两个张量：
+#### 背景：为什么需要 OEL 预算架构
 
-| 张量 | Shape | 类型 | 估算大小（bsz=16, L=20K, k=256） |
-|------|-------|------|--------------------------------|
-| `kl_topk_indices` | (B, L, k) | int64 | 16 × 20000 × 256 × 8 B ≈ **655 MB** |
-| `ref_log_prob_topk` | (B, L, k) | float32 | 16 × 20000 × 256 × 4 B ≈ **328 MB** |
+未经优化的 analytic_kl（非 OEL）需要在 `update_policy` 里每个 mini-batch 都做一次完整 ref forward，
+产生 `(B_mini, L, V)` ref logits 张量，额外 GPU 显存开销极大。
+OEL 架构将 ref forward 从 `update_policy` 里搬出来，变成训练步开始前的 1 次预算。
 
-这些张量存放在 CPU 内存（`.to("cpu")` 后入 batch），不占用 GPU 显存。
-`update_policy` 阶段仅需 student `(B, L, V)` logits（用于计算 student top-k log-probs），
-无额外 ref forward，相比在 `update_policy` 内每次做完整 ref forward 节省大量 GPU 显存。
+#### CPU 内存：多出两个 batch 张量
+
+| 对比 | 额外 CPU 内存 |
+|------|--------------|
+| k3（基线） | 0（`ref_log_prob` 已存在，(B,L) 共 256 KB @ B=64,L=1024） |
+| top-256 OEL | `kl_topk_indices` + `ref_log_prob_topk`，约 **200 MB** @ B=64,L=1024 |
+| top-256 OEL | 约 **800 MB** @ B=64,L=4096（长序列场景） |
+| full-vocab OEL（V=32K） | 约 **8 GB** @ B=64,L=1024 |
+| full-vocab OEL（V=150K，Qwen） | 约 **38 GB** |
+
+> CPU 内存放在 batch 里随数据流动，不占 GPU 显存，对一般机器（256 GB 内存）影响可忽略（除全词表外）。
+
+公式：`kl_topk_indices` = B × L × k × 8 B（int64），`ref_log_prob_topk` = B × L × k × 4 B（float32）
+
+#### GPU 显存（update_policy 阶段，per micro-batch）
+
+关键事实：**k3 和 analytic_kl（OEL）在 update_policy 阶段都需要计算完整 logits (B_micro, L, V)**，
+这是获取 log_prob 所必须的，两者峰值相同。analytic_kl 仅额外多出：
+
+| 额外张量 | Shape | GPU 显存 @ B_micro=2,L=1024,k=256 |
+|---------|-------|-----------------------------------|
+| `student_log_probs_topk` | (B_micro, L, k) float32 | 2 × 1024 × 256 × 4 B ≈ **2 MB** |
+| `ref_log_prob_topk`（从 CPU 搬来） | (B_micro, L, k) float32 | ≈ **2 MB** |
+| **合计** | | ≈ **4 MB** |
+
+结论：**与 k3 相比，OEL 路径几乎不增加 GPU 显存**（4 MB vs logits 动辄数 GB）。
+
+#### 计算开销（额外 forward pass 次数）
+
+| 方案 | 每训练步额外 forward 次数 |
+|------|--------------------------|
+| k3 | 0（ref_log_prob 在 rollout 时已算好） |
+| top-256 OEL（本实现） | **actor × 1 + ref × 1**（OEL 预算） |
+| 非 OEL analytic_kl（假设 2 PPO epoch × 4 mini-batch） | actor × 0 + ref × **8** |
+
+OEL 把 ref forward 从 K×M 次压缩为 1 次，代价是 1 次额外 actor forward（用于计算 student top-k indices）。
+
+#### 汇总对比（B=64, L=1024, k=256, V=32K, 2 epoch × 4 mini-batch）
+
+| 方案 | 额外 CPU 内存 | 额外 GPU 峰值（per micro-batch） | 额外 forward 次/步 |
+|------|-------------|--------------------------------|-------------------|
+| k3 基线 | 0 | 0 | 0 |
+| **top-256 OEL（推荐）** | **~200 MB** | **~4 MB** | **actor×1 + ref×1** |
+| top-256 非 OEL | 0 | ~500 MB（ref logits）× 8 次 | ref×8 |
+| full-vocab OEL | ~8 GB | ~4 MB | actor×1 + ref×1 |
+| full-vocab 非 OEL | 0 | ~8 GB × 8 次 | ref×8（每次全词表） |
+
+**结论**：top-256 OEL 相对 k3 只多 ~200 MB CPU + 4 MB GPU，代价极低；
+相对于非 OEL 的 analytic_kl，节省了 K×M 次 ref forward 和对应的 GPU 峰值显存。
 
 ---
 
