@@ -21,6 +21,65 @@
 
 ---
 
+## 完整训练 Workflow
+
+每个训练 step 的执行顺序如下（加粗为新增步骤）：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ Step N                                                              │
+│                                                                     │
+│  1. Rollout                                                         │
+│     actor_rollout_wg.generate_sequences(prompts)                   │
+│     → batch: input_ids, responses, attention_mask, ...             │
+│                                                                     │
+│  2. 标准 ref log-prob（已有，k3 也需要）                             │
+│     ref_policy_wg.compute_ref_log_prob(batch)                      │
+│     → batch += ref_log_prob  (B, L)  float32                       │
+│                                                                     │
+│  3. ★ OEL 预算 Step A：Student top-k indices（新增）               │
+│     actor_rollout_wg.compute_kl_topk_indices(batch)                │
+│       内部：actor forward（padded）→ log_softmax → top-k           │
+│     → batch += kl_topk_indices  (B, L, k)  int64  [存 CPU]        │
+│                                                                     │
+│  4. ★ OEL 预算 Step B：Ref gathered log-probs（新增）              │
+│     ref_policy_wg.compute_ref_log_prob_topk(batch)                 │
+│       内部：ref forward（padded）→ log_softmax → gather at indices │
+│     → batch += ref_log_prob_topk  (B, L, k)  float32  [存 CPU]   │
+│                                                                     │
+│  5. 奖励 / 优势计算（标准，不变）                                    │
+│     compute_rewards / compute_advantage                            │
+│                                                                     │
+│  6. update_policy（K epoch × M mini-batch，不变结构）               │
+│     for epoch in K:                                                 │
+│       for mini_batch in M:                                          │
+│         _forward_micro_batch_with_topk(mini_batch)                 │
+│           input: input_ids + attention_mask（padded path）          │
+│           → logits (B_mini, L, V)                                  │
+│           → log_softmax → gather at kl_topk_indices                │
+│           → student_log_probs_topk (B_mini, L, k)                  │
+│         load ref_log_prob_topk from batch (CPU → GPU)              │
+│         analytic KL = Σ stu_p × (stu_lp − ref_lp)  per token      │
+│         → (B_mini, L)，mask + aggregate → kl_loss                  │
+│         policy_loss + kl_loss × kl_coef → backward                │
+│         ← 无额外 ref forward！                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 与 k3 的步骤对比
+
+| 步骤 | k3 (`low_var_kl`) | `analytic_kl`（OEL） |
+|------|-------------------|----------------------|
+| Rollout | ✓ | ✓（相同） |
+| compute_ref_log_prob → (B,L) | ✓ | ✓（相同） |
+| compute_kl_topk_indices | — | **★ 新增，actor×1** |
+| compute_ref_log_prob_topk | — | **★ 新增，ref×1** |
+| update_policy 每个 mini-batch | actor forward → gather 1 token log-prob | actor forward → gather k token log-probs，无 ref forward |
+| 总 ref forward 次数/step | 1（rollout 时） | 2（+OEL Step B） |
+| update_policy 内 ref forward | 0 | 0 ← OEL 的核心节省 |
+
+---
+
 ## 与现有 k1/k2/k3 的本质区别
 
 | | k1 / k2 / k3 (`low_var_kl`) | `analytic_kl` |
@@ -268,10 +327,17 @@ actor_rollout_ref:
 
 **强烈推荐使用 `topk_kl_k: 256` 走 OEL 预算路径。**
 
-### 3. `remove_padding=True` 路径未经测试
+### 3. `remove_padding=True` 结果正确，但该路径不走 remove_padding 优化
 
-理论上可用，但目前尚未在 variable-length / remove_padding 场景中验证。
-首次使用建议关闭 `remove_padding`，验证后再开启。
+`_forward_micro_batch_with_topk` 内部始终向模型传入 `attention_mask`，强制走 padded forward，
+绕开了 `use_remove_padding` 的 input unpadding 逻辑。
+
+**正确性**：完全正确。padded forward 与 remove_padding forward 计算等价，
+logits 形状为 `(B, seqlen, V)`，切片 `[:, -response_length-1:-1, :]` 正常工作。
+
+**性能影响**：analytic_kl 相关的 forward pass（OEL 预算的 2 次 + update_policy 里的 actor forward）
+不享受 remove_padding 的速度提升，相当于这几次 forward 退回到带 padding 的模式，略慢。
+rollout 及其余步骤的 remove_padding 行为**不受任何影响**。
 
 ### 4. 显存说明（与原始 k3 的详细对比）
 
