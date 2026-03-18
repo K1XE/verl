@@ -1752,3 +1752,91 @@ def compute_policy_loss_rollout_correction_wrapper(
         rollout_token_veto_threshold=rollout_token_veto_threshold,
         rollout_is_batch_normalize=rollout_is_batch_normalize,
     )
+
+
+def topk_analytic_kl(
+    student_logits,
+    ref_logits,
+    k=256,
+    mode="reverse_kl",
+    jsd_beta=0.5,
+):
+    """Analytic KL/JSD divergence supporting top-k approximation or full-vocab exact computation.
+
+    Args:
+        student_logits: (B, L, V) raw logits from student model
+        ref_logits:     (B, L, V) raw logits from reference model
+        k:   number of top-k tokens to sum over; None or 0 means full vocabulary
+        mode: "reverse_kl" | "forward_kl" | "jsd" | "symmetric_kl"
+        jsd_beta: mixture weight β for jsd mode (β=0.5 → symmetric JSD)
+
+    Returns:
+        Tensor of shape (B, L) containing per-token KL values (non-negative).
+    """
+    import torch.nn.functional as F
+
+    use_full = k is None or k <= 0
+
+    student_log_probs = F.log_softmax(student_logits, dim=-1)
+    ref_log_probs     = F.log_softmax(ref_logits, dim=-1)
+    student_probs     = student_log_probs.exp()
+    ref_probs         = ref_log_probs.exp()
+
+    if mode == "reverse_kl":
+        if use_full:
+            return (student_probs * (student_log_probs - ref_log_probs)).sum(-1)
+        _, idx = student_probs.topk(k, dim=-1)
+        p   = student_probs.gather(-1, idx)
+        lps = student_log_probs.gather(-1, idx)
+        lpr = ref_log_probs.gather(-1, idx)
+        return (p * (lps - lpr)).sum(-1)
+
+    elif mode == "forward_kl":
+        if use_full:
+            return (ref_probs * (ref_log_probs - student_log_probs)).sum(-1)
+        _, idx = ref_probs.topk(k, dim=-1)
+        p   = ref_probs.gather(-1, idx)
+        lpr = ref_log_probs.gather(-1, idx)
+        lps = student_log_probs.gather(-1, idx)
+        return (p * (lpr - lps)).sum(-1)
+
+    elif mode == "jsd":
+        beta = jsd_beta
+        if use_full:
+            m     = beta * ref_probs + (1.0 - beta) * student_probs
+            log_m = m.clamp(min=1e-30).log()
+            kl_r  = (ref_probs     * (ref_log_probs     - log_m)).sum(-1)
+            kl_s  = (student_probs * (student_log_probs - log_m)).sum(-1)
+            return beta * kl_r + (1.0 - beta) * kl_s
+        _, si = student_probs.topk(k, dim=-1)
+        _, ri = ref_probs.topk(k, dim=-1)
+        idx   = torch.cat([si, ri], dim=-1)
+        ps    = student_probs.gather(-1, idx)
+        pr    = ref_probs.gather(-1, idx)
+        m     = beta * pr + (1.0 - beta) * ps
+        log_m = m.clamp(min=1e-30).log()
+        lps   = student_log_probs.gather(-1, idx)
+        lpr   = ref_log_probs.gather(-1, idx)
+        kl_r  = (pr * (lpr - log_m)).sum(-1)
+        kl_s  = (ps * (lps - log_m)).sum(-1)
+        return beta * kl_r + (1.0 - beta) * kl_s
+
+    elif mode == "symmetric_kl":
+        if use_full:
+            fwd = (ref_probs     * (ref_log_probs     - student_log_probs)).sum(-1)
+            rev = (student_probs * (student_log_probs - ref_log_probs)).sum(-1)
+            return 0.5 * (fwd + rev)
+        _, si  = student_probs.topk(k, dim=-1)
+        _, ri  = ref_probs.topk(k, dim=-1)
+        idx    = torch.cat([si, ri], dim=-1)
+        ps     = student_probs.gather(-1, idx)
+        pr     = ref_probs.gather(-1, idx)
+        lps    = student_log_probs.gather(-1, idx)
+        lpr    = ref_log_probs.gather(-1, idx)
+        return 0.5 * ((pr * (lpr - lps)).sum(-1) + (ps * (lps - lpr)).sum(-1))
+
+    else:
+        raise ValueError(
+            f"topk_analytic_kl: unknown mode='{mode}'. "
+            "Choose 'reverse_kl', 'forward_kl', 'jsd', or 'symmetric_kl'."
+        )

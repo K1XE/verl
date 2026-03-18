@@ -84,8 +84,17 @@ use_torch_compile: true
 # KL loss coefficient when use_kl_loss is enabled. For GRPO
 kl_loss_coef: 0.001
 
-# Type of KL divergence loss. Options: "kl"(k1), "abs", "mse"(k2), "low_var_kl"(k3), "full"
+# Type of KL divergence loss. Options: "kl"(k1), "abs", "mse"(k2), "low_var_kl"(k3), "full",
+#   "analytic_kl" (top-k or full-vocab analytic KL/JSD; OPCD arXiv:2602.12275 / OPSD arXiv:2601.18734)
 kl_loss_type: low_var_kl
+
+# --- analytic_kl options (only used when kl_loss_type: analytic_kl) ---
+# Number of top-k vocabulary tokens. 0 = full vocabulary (exact, higher memory).
+topk_kl_k: 256
+# Divergence formula: "reverse_kl" | "forward_kl" | "jsd" | "symmetric_kl"
+topk_kl_mode: reverse_kl
+# Mixture weight β for "jsd" mode: β=0.5 → symmetric JSD.
+topk_kl_jsd_beta: 0.5
 
 # Number of PPO epochs per batch
 ppo_epochs: 1

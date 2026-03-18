@@ -1030,8 +1030,60 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         return output
 
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="purple", role="actor_compute_kl_topk_indices")
+    def compute_kl_topk_indices(self, data: DataProto) -> DataProto:
+        """OEL pre-computation step 1: compute student top-k indices (called on actor_rollout_wg)."""
+        assert self._is_actor
+        data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
+        data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
+        data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
+        data.meta_info["temperature"] = self.config.rollout.temperature
+        data.meta_info["kl_topk_k"] = self.config.actor.topk_kl_k
+
+        with self.ulysses_sharding_manager:
+            result = self.actor.compute_kl_topk_indices(data=data)
+            output = DataProto.from_dict(tensors={"kl_topk_indices": result["kl_topk_indices"]})
+
+        return output.to("cpu")
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="purple", role="ref_compute_ref_log_prob_topk")
+    def compute_ref_log_prob_topk(self, data: DataProto) -> DataProto:
+        """OEL pre-computation step 2: gather ref log-probs at top-k positions (called on ref_policy_wg)."""
+        if self._is_lora:
+            data.meta_info["micro_batch_size"] = self.config.ref.log_prob_micro_batch_size_per_gpu
+            data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
+            data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
+            data.meta_info["temperature"] = self.config.rollout.temperature
+            with self.ulysses_sharding_manager:
+                with self.actor.actor_module.disable_adapter():
+                    result = self.actor.compute_ref_log_prob_topk(data=data)
+            output = DataProto.from_dict(tensors={"ref_log_prob_topk": result["ref_log_prob_topk"]})
+            return output.to("cpu")
+
+        assert self._is_ref
+        data.meta_info["micro_batch_size"] = self.config.ref.log_prob_micro_batch_size_per_gpu
+        data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
+        data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
+        data.meta_info["temperature"] = self.config.rollout.temperature
+
+        with self.ulysses_sharding_manager:
+            data = data.to("cpu")
+            result = self.ref_policy.compute_ref_log_prob_topk(data=data)
+            output = DataProto.from_dict(tensors={"ref_log_prob_topk": result["ref_log_prob_topk"]})
+
+        output = output.to("cpu")
+
+        if self.world_size > 1:
+            if fsdp_version(self.ref_policy.actor_module) == 1:
+                self.ref_policy.actor_module._handle.reshard(True)
+            elif fsdp_version(self.ref_policy.actor_module) == 2:
+                self.ref_policy.actor_module.reshard()
+
+        return output
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
         from verl.utils.logger import log_with_rank
 
         # only support save and load ckpt for actor

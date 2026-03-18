@@ -27,7 +27,7 @@ from torch.distributed.tensor import DTensor
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty, topk_analytic_kl
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -280,7 +280,120 @@ class DataParallelPPOActor(BasePPOActor):
 
             return entropy, log_probs
 
-    def _optimizer_step(self):
+    def _forward_micro_batch_with_topk(
+        self,
+        micro_batch,
+        temperature: float,
+        kl_topk_indices=None,
+        kl_topk_k: int = 256,
+        calculate_entropy: bool = False,
+    ):
+        """Forward pass that also computes analytic_kl top-k tensors (non-fused path only).
+
+        Args:
+            micro_batch: dict of model inputs
+            temperature: sampling temperature
+            kl_topk_indices: (B, L, k) int64 tensor. If None, computes and returns top-k indices.
+                If provided, gathers student log-probs at those positions.
+            kl_topk_k: number of top-k tokens (used only when kl_topk_indices is None)
+            calculate_entropy: whether to compute entropy
+
+        Returns:
+            (entropy, log_probs, topk_result) where topk_result is:
+                - kl_topk_indices (B, L, k) int64 if kl_topk_indices was None
+                - student_log_probs_topk (B, L, k) float if kl_topk_indices was provided
+        """
+        assert not self.use_fused_kernels, (
+            "analytic_kl is not supported with use_fused_kernels=True. Set use_fused_kernels=False."
+        )
+
+        response_length = micro_batch["responses"].size(-1)
+
+        with torch.autocast(device_type=self.device_name, dtype=self.param_dtype):
+            input_ids = micro_batch["input_ids"]
+            attention_mask = micro_batch["attention_mask"]
+            position_ids = micro_batch["position_ids"]
+
+            output = self.actor_module(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                use_cache=False,
+            )
+
+            logits = output.logits
+            logits.div_(temperature)
+            logits = logits[:, -response_length - 1 : -1, :]  # (B, L, V)
+            log_probs = logprobs_from_logits(logits, micro_batch["responses"])
+
+            entropy = None
+            if calculate_entropy:
+                if not self.config.entropy_checkpointing:
+                    entropy = verl_F.entropy_from_logits(logits)
+                else:
+                    entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
+
+            with torch.no_grad():
+                log_probs_full = torch.nn.functional.log_softmax(logits, dim=-1)  # (B, L, V)
+                if kl_topk_indices is None:
+                    _, topk_result = log_probs_full.topk(kl_topk_k, dim=-1)  # (B, L, k)
+                else:
+                    topk_result = log_probs_full.gather(-1, kl_topk_indices.to(logits.device))  # (B, L, k)
+
+        return entropy, log_probs, topk_result
+
+    def compute_kl_topk_indices(self, data: DataProto) -> dict:
+        """OEL pre-computation step 1: compute student top-k token indices.
+
+        Returns:
+            dict with ``kl_topk_indices``: (B, response_length, k) int64 tensor.
+        """
+        self.actor_module.eval()
+        k = data.meta_info["kl_topk_k"]
+        micro_batch_size = data.meta_info["micro_batch_size"]
+        temperature = data.meta_info["temperature"]
+
+        select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
+        data = data.select(batch_keys=select_keys)
+        micro_batches = data.split(micro_batch_size)
+
+        idx_list = []
+        for micro_batch in micro_batches:
+            micro_batch = micro_batch.to(get_device_id())
+            model_inputs = {**micro_batch.batch}
+            with torch.no_grad():
+                _, _, topk_idx = self._forward_micro_batch_with_topk(
+                    model_inputs, temperature=temperature, kl_topk_k=k
+                )
+            idx_list.append(topk_idx)
+        return {"kl_topk_indices": torch.cat(idx_list, dim=0)}  # (B, L, k)
+
+    def compute_ref_log_prob_topk(self, data: DataProto) -> dict:
+        """OEL pre-computation step 2: gather ref log-probs at student top-k positions.
+
+        Expects ``kl_topk_indices`` in ``data.batch``.
+        Returns:
+            dict with ``ref_log_prob_topk``: (B, response_length, k) float32 tensor.
+        """
+        self.actor_module.eval()
+        micro_batch_size = data.meta_info["micro_batch_size"]
+        temperature = data.meta_info["temperature"]
+
+        select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "kl_topk_indices"]
+        data = data.select(batch_keys=select_keys)
+        micro_batches = data.split(micro_batch_size)
+
+        ref_lp_list = []
+        for micro_batch in micro_batches:
+            micro_batch = micro_batch.to(get_device_id())
+            model_inputs = {**micro_batch.batch}
+            kl_topk_indices = model_inputs.pop("kl_topk_indices")
+            with torch.no_grad():
+                _, _, ref_lp = self._forward_micro_batch_with_topk(
+                    model_inputs, temperature=temperature, kl_topk_indices=kl_topk_indices
+                )
+            ref_lp_list.append(ref_lp)
+        return {"ref_log_prob_topk": torch.cat(ref_lp_list, dim=0)}  # (B, L, k)
         assert self.config.grad_clip is not None
         if self.scaler is not None:
             self.scaler.unscale_(self.actor_optimizer)
@@ -386,6 +499,12 @@ class DataParallelPPOActor(BasePPOActor):
         ]
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
+            # OEL pre-computed tensors for analytic_kl
+            if getattr(self.config, "kl_loss_type", "") == "analytic_kl":
+                if "kl_topk_indices" in data.batch:
+                    select_keys.append("kl_topk_indices")
+                if "ref_log_prob_topk" in data.batch:
+                    select_keys.append("ref_log_prob_topk")
         # Include pre-computed IS weights if present in batch
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
         if "rollout_is_weights" in data.batch.keys():
@@ -439,9 +558,25 @@ class DataParallelPPOActor(BasePPOActor):
                     calculate_entropy = False
                     if entropy_coeff != 0:
                         calculate_entropy = True
-                    entropy, log_prob = self._forward_micro_batch(
-                        model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+
+                    # Use topk-aware forward when analytic_kl OEL pre-computation is active
+                    _use_analytic_topk = (
+                        getattr(self.config, "kl_loss_type", "") == "analytic_kl"
+                        and getattr(self.config, "topk_kl_k", 256) > 0
+                        and "kl_topk_indices" in model_inputs
                     )
+                    if _use_analytic_topk:
+                        entropy, log_prob, _stu_lp_topk = self._forward_micro_batch_with_topk(
+                            model_inputs,
+                            temperature=temperature,
+                            kl_topk_indices=model_inputs["kl_topk_indices"].to(get_device_id()),
+                            calculate_entropy=calculate_entropy,
+                        )
+                    else:
+                        entropy, log_prob = self._forward_micro_batch(
+                            model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                        )
+                        _stu_lp_topk = None
 
                     # for fully_async_policy recipe
                     if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
@@ -498,13 +633,24 @@ class DataParallelPPOActor(BasePPOActor):
                         policy_loss = pg_loss
 
                     if self.config.use_kl_loss:
-                        ref_log_prob = model_inputs["ref_log_prob"]
-                        # compute kl loss
-                        kld = kl_penalty(
-                            logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
-                        )
+                        if getattr(self.config, "kl_loss_type", "") == "analytic_kl":
+                            k_val = getattr(self.config, "topk_kl_k", 256)
+                            if k_val > 0 and _stu_lp_topk is not None and "ref_log_prob_topk" in model_inputs:
+                                # OEL path: use pre-computed ref log-probs
+                                ref_lp = model_inputs["ref_log_prob_topk"].to(_stu_lp_topk.device)
+                                stu_p = _stu_lp_topk.exp()
+                                kld = (stu_p * (_stu_lp_topk - ref_lp)).sum(-1)  # (B, L)
+                            else:
+                                raise AssertionError(
+                                    "analytic_kl requires pre-computed kl_topk_indices and ref_log_prob_topk "
+                                    "in batch. Ensure ray_trainer.py Patch 4 is applied and topk_kl_k > 0."
+                                )
+                        else:
+                            ref_log_prob = model_inputs["ref_log_prob"]
+                            kld = kl_penalty(
+                                logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
+                            )
                         kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-
                         policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                         micro_batch_metrics["actor/kl_loss"] = kl_loss.detach().item() * loss_scale_factor
                         micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
