@@ -85,13 +85,14 @@ kl_loss_coef: 0.001
 
 ---
 
-## 修改的文件（共 4 个）
+## 修改的文件（共 5 个）
 
 | 文件 | 修改内容 |
 |------|---------|
 | `verl/trainer/ppo/core_algos.py` | 新增 `topk_analytic_kl()` 函数 |
-| `verl/workers/actor/dp_actor.py` | `__init__` 加 `ref_module` 参数；`_forward_micro_batch` 返回 logits；`update_policy` 加 `analytic_kl` 分支 |
-| `verl/workers/fsdp_workers.py` | `_is_ref` 块末尾注入 `ref_module_fsdp` 给 actor |
+| `verl/workers/actor/dp_actor.py` | OEL 预算方式：新增 `compute_kl_topk_indices`、`compute_ref_log_prob_topk` 方法；`_forward_micro_batch` 加 top-k gather 逻辑；`update_policy` 用预算 ref log-probs |
+| `verl/workers/fsdp_workers.py` | 新增 `compute_kl_topk_indices`、`compute_ref_log_prob_topk` dispatch 方法 |
+| `verl/trainer/ppo/ray_trainer.py` | 训练循环 ref forward 之后插入 OEL 预算步骤（一次性预算 top-k indices + ref log-probs） |
 | `verl/trainer/config/actor/actor.yaml` | 新增 `topk_kl_k`、`topk_kl_mode`、`topk_kl_jsd_beta` 三个字段 |
 
 ---

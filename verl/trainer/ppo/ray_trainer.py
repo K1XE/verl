@@ -1431,6 +1431,21 @@ class RayPPOTrainer:
                             ref_log_prob = self._compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
 
+                    # OEL-style pre-computation: gather ref log-probs at student top-k positions
+                    # This avoids K×M ref forwards inside update_policy, cutting memory and compute.
+                    actor_cfg = self.config.actor_rollout_ref.actor
+                    if (
+                        getattr(actor_cfg, "use_kl_loss", False)
+                        and getattr(actor_cfg, "kl_loss_type", "") == "analytic_kl"
+                        and getattr(actor_cfg, "topk_kl_k", 256) > 0
+                        and self.use_reference_policy
+                    ):
+                        with marked_timer("analytic_kl_topk_precompute", timing_raw, color="purple"):
+                            topk_idx_proto = self.actor_rollout_wg.compute_kl_topk_indices(batch)
+                            batch = batch.union(topk_idx_proto)
+                            ref_topk_proto = self.ref_policy_wg.compute_ref_log_prob_topk(batch)
+                            batch = batch.union(ref_topk_proto)
+
                     # compute values
                     if self.use_critic:
                         with marked_timer("values", timing_raw, color="cyan"):

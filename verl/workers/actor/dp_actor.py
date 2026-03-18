@@ -118,7 +118,12 @@ class DataParallelPPOActor(BasePPOActor):
             )
 
     def _forward_micro_batch(
-        self, micro_batch: dict[str, torch.Tensor], temperature: float, calculate_entropy: bool = False
+        self,
+        micro_batch: dict[str, torch.Tensor],
+        temperature: float,
+        calculate_entropy: bool = False,
+        return_topk_indices: bool = False,
+        kl_topk_k: int = 256,
     ) -> dict[str, torch.Tensor]:
         """
         Returns:
@@ -393,9 +398,22 @@ class DataParallelPPOActor(BasePPOActor):
                 outputs["entropys"] = entropy
             if calculate_sum_pi_squared:
                 outputs["sum_pi_squared"] = sum_pi_squared
-            # Retain response-segment logits for analytic_kl (non-fused path only)
+
+            # analytic_kl helpers (non-fused path only)
             if not self.use_fused_kernels and getattr(self.config, "kl_loss_type", "") == "analytic_kl":
-                outputs["logits"] = logits  # (bsz, response_length, V), temperature already applied
+                if return_topk_indices:
+                    # Return top-k indices for pre-computation of ref log-probs (OEL-style)
+                    log_probs_full = torch.nn.functional.log_softmax(logits, dim=-1)
+                    _, topk_idx = log_probs_full.topk(kl_topk_k, dim=-1)  # (bsz, response_length, k)
+                    outputs["kl_topk_indices"] = topk_idx
+                elif "kl_topk_indices" in micro_batch:
+                    # Gather student log-probs at pre-computed top-k positions
+                    topk_idx = micro_batch["kl_topk_indices"].to(logits.device)  # (bsz, response_length, k)
+                    log_probs_full = torch.nn.functional.log_softmax(logits, dim=-1)
+                    outputs["student_log_probs_topk"] = log_probs_full.gather(-1, topk_idx)  # (bsz, L, k)
+                else:
+                    # Fallback: retain full logits for in-place ref forward (k=0 or missing indices)
+                    outputs["logits"] = logits  # (bsz, response_length, V)
             return outputs
 
     def _optimizer_step(self):
@@ -515,8 +533,80 @@ class DataParallelPPOActor(BasePPOActor):
             outputs["sum_pi_squared"] = sum_pi_squared
         return outputs
 
-    @GPUMemoryLogger(role="dp actor", logger=logger)
-    def update_policy(self, data: DataProto):
+    def compute_kl_topk_indices(self, data: DataProto) -> dict[str, torch.Tensor]:
+        """Compute student top-k token indices for analytic_kl pre-computation (OEL-style).
+
+        Returns:
+            dict with ``kl_topk_indices``: (B, response_length, k) int64 tensor.
+        """
+        self.actor_module.eval()
+        k = data.meta_info["kl_topk_k"]
+        micro_batch_size = data.meta_info["micro_batch_size"]
+        temperature = data.meta_info["temperature"]
+        use_dynamic_bsz = data.meta_info.get("use_dynamic_bsz", False)
+        pad_token_id = data.meta_info.get("pad_token_id", 0)
+
+        select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
+        data = data.select(batch_keys=select_keys)
+
+        if use_dynamic_bsz:
+            max_token_len = data.meta_info["max_token_len"] * self.ulysses_sequence_parallel_size
+            micro_batches, batch_idx_list = prepare_dynamic_batch(data, max_token_len=max_token_len)
+        else:
+            micro_batches = data.split(micro_batch_size)
+
+        idx_list = []
+        for micro_batch in micro_batches:
+            micro_batch = micro_batch.to(get_device_id())
+            model_inputs = {**micro_batch.batch, "pad_token_id": pad_token_id}
+            with torch.no_grad():
+                outputs = self._forward_micro_batch(
+                    model_inputs, temperature=temperature, return_topk_indices=True, kl_topk_k=k
+                )
+            idx_list.append(outputs["kl_topk_indices"])
+
+        kl_topk_indices = torch.cat(idx_list, dim=0)  # (B, L, k)
+        if use_dynamic_bsz:
+            kl_topk_indices = restore_dynamic_batch(kl_topk_indices, batch_idx_list)
+        return {"kl_topk_indices": kl_topk_indices}
+
+    def compute_ref_log_prob_topk(self, data: DataProto) -> dict[str, torch.Tensor]:
+        """Gather ref model log-probs at student top-k positions (OEL-style pre-computation).
+
+        Expects ``kl_topk_indices`` in ``data.batch``.
+
+        Returns:
+            dict with ``ref_log_prob_topk``: (B, response_length, k) float32 tensor.
+        """
+        self.actor_module.eval()
+        micro_batch_size = data.meta_info["micro_batch_size"]
+        temperature = data.meta_info["temperature"]
+        use_dynamic_bsz = data.meta_info.get("use_dynamic_bsz", False)
+        pad_token_id = data.meta_info.get("pad_token_id", 0)
+
+        select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "kl_topk_indices"]
+        data = data.select(batch_keys=select_keys)
+
+        if use_dynamic_bsz:
+            max_token_len = data.meta_info["max_token_len"] * self.ulysses_sequence_parallel_size
+            micro_batches, batch_idx_list = prepare_dynamic_batch(data, max_token_len=max_token_len)
+        else:
+            micro_batches = data.split(micro_batch_size)
+
+        ref_lp_list = []
+        for micro_batch in micro_batches:
+            micro_batch = micro_batch.to(get_device_id())
+            model_inputs = {**micro_batch.batch, "pad_token_id": pad_token_id}
+            with torch.no_grad():
+                outputs = self._forward_micro_batch(model_inputs, temperature=temperature)
+            ref_lp_list.append(outputs["student_log_probs_topk"])  # uses gather path via kl_topk_indices
+
+        ref_log_prob_topk = torch.cat(ref_lp_list, dim=0)  # (B, L, k)
+        if use_dynamic_bsz:
+            ref_log_prob_topk = restore_dynamic_batch(ref_log_prob_topk, batch_idx_list)
+        return {"ref_log_prob_topk": ref_log_prob_topk}
+
+
         # make sure we are in training mode
         self.actor_module.train()
 
@@ -536,6 +626,12 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append("prompts")
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
+            # OEL-style pre-computed top-k tensors for analytic_kl
+            if getattr(self.config, "kl_loss_type", "") == "analytic_kl":
+                if "kl_topk_indices" in data.batch:
+                    select_keys.append("kl_topk_indices")
+                if "ref_log_prob_topk" in data.batch:
+                    select_keys.append("ref_log_prob_topk")
         # Include pre-computed IS weights if present in batch
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
         if "rollout_is_weights" in data.batch.keys():
@@ -656,30 +752,38 @@ class DataParallelPPOActor(BasePPOActor):
 
                     if self.config.use_kl_loss:
                         if getattr(self.config, "kl_loss_type", "") == "analytic_kl":
-                            assert self.ref_module is not None, (
-                                "kl_loss_type='analytic_kl' requires ref_module to be injected into "
-                                "DataParallelPPOActor. Set kl_loss_type='analytic_kl' only when the worker "
-                                "has access to a ref model (ActorRolloutRefWorker with _is_ref=True)."
-                            )
-                            assert "logits" in outputs, (
-                                "analytic_kl requires logits from _forward_micro_batch. "
-                                "use_fused_kernels=True is not supported with analytic_kl."
-                            )
-                            k_val = getattr(self.config, "topk_kl_k", 256) or None  # 0 → None → full-vocab
-                            kl_mode = getattr(self.config, "topk_kl_mode", "reverse_kl")
-                            jsd_beta = getattr(self.config, "topk_kl_jsd_beta", 0.5)
-                            response_length = response_mask.shape[-1]
-                            with torch.no_grad():
-                                ref_out = self.ref_module(
-                                    input_ids=model_inputs["input_ids"],
-                                    attention_mask=model_inputs["attention_mask"],
-                                    position_ids=model_inputs.get("position_ids"),
-                                    use_cache=False,
+                            k_val = getattr(self.config, "topk_kl_k", 256)
+                            if k_val > 0 and "ref_log_prob_topk" in model_inputs:
+                                # OEL-style: use pre-computed ref log-probs gathered at student top-k positions
+                                stu_lp = outputs["student_log_probs_topk"]  # (B, L, k)
+                                ref_lp = model_inputs["ref_log_prob_topk"].to(stu_lp.device)  # (B, L, k)
+                                stu_p = stu_lp.exp()
+                                kld = (stu_p * (stu_lp - ref_lp)).sum(-1)  # (B, L)
+                            else:
+                                # Fallback: full-vocab or pre-computation unavailable → real-time ref forward
+                                assert self.ref_module is not None, (
+                                    "kl_loss_type='analytic_kl' with k=0 (full-vocab) requires ref_module "
+                                    "injected into DataParallelPPOActor."
                                 )
-                                ref_logits = ref_out.logits[:, -response_length - 1 : -1, :]
-                            kld = topk_analytic_kl(
-                                outputs["logits"], ref_logits, k=k_val, mode=kl_mode, jsd_beta=jsd_beta
-                            )
+                                assert "logits" in outputs, (
+                                    "analytic_kl requires logits from _forward_micro_batch. "
+                                    "use_fused_kernels=True is not supported with analytic_kl."
+                                )
+                                k_val_opt = k_val or None  # 0 → None → full-vocab
+                                kl_mode = getattr(self.config, "topk_kl_mode", "reverse_kl")
+                                jsd_beta = getattr(self.config, "topk_kl_jsd_beta", 0.5)
+                                response_length = response_mask.shape[-1]
+                                with torch.no_grad():
+                                    ref_out = self.ref_module(
+                                        input_ids=model_inputs["input_ids"],
+                                        attention_mask=model_inputs["attention_mask"],
+                                        position_ids=model_inputs.get("position_ids"),
+                                        use_cache=False,
+                                    )
+                                    ref_logits = ref_out.logits[:, -response_length - 1 : -1, :]
+                                kld = topk_analytic_kl(
+                                    outputs["logits"], ref_logits, k=k_val_opt, mode=kl_mode, jsd_beta=jsd_beta
+                                )
                         else:
                             ref_log_prob = model_inputs["ref_log_prob"]
                             kld = kl_penalty(
