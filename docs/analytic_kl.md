@@ -77,11 +77,11 @@ kl_loss_coef: 0.001
 
 1. **`use_fused_kernels` 必须为 `false`**：fused kernel 路径不经过 `output.logits`，无法获取完整 logits，启用时会报 AssertionError。
 
-2. **worker 必须同时承载 ref model（`_is_ref=True`）**：standard `ActorRolloutRefWorker` 默认满足此条件。
+2. **`topk_kl_k=0`（全词表模式）不走 OEL 预算路径**：仍需在 `DataParallelPPOActor.__init__` 注入 `ref_module`，并在 `fsdp_workers.py` 回填（参考旧实现），显存开销较大。**推荐使用 `topk_kl_k: 256` 走 OEL 预算路径。**
 
 3. **`remove_padding=True` 路径未经测试**：理论可用但未验证，建议关闭 remove_padding 进行首次测试。
 
-4. **显存**：每个 micro-batch 额外保存 `(B, L, V)` student logits + ref model 做一次 no_grad forward。对长序列（L > 2048）或大词表（V > 32000）压力较大，建议减小 `ppo_mini_batch_size`。
+4. **显存（OEL 预算路径）**：预算阶段临时存储 `(B, L, k)` student indices + ref log-probs（top-256 约 328 MB @bsz=16,L=20k），`update_policy` 阶段仅需 student `(B, L, V)` logits，无额外 ref forward，相比旧版本大幅降低显存峰值。
 
 ---
 
@@ -90,9 +90,9 @@ kl_loss_coef: 0.001
 | 文件 | 修改内容 |
 |------|---------|
 | `verl/trainer/ppo/core_algos.py` | 新增 `topk_analytic_kl()` 函数 |
-| `verl/workers/actor/dp_actor.py` | OEL 预算方式：新增 `compute_kl_topk_indices`、`compute_ref_log_prob_topk` 方法；`_forward_micro_batch` 加 top-k gather 逻辑；`update_policy` 用预算 ref log-probs |
+| `verl/workers/actor/dp_actor.py` | OEL 预算方式：新增 `compute_kl_topk_indices`、`compute_ref_log_prob_topk` 方法；`_forward_micro_batch` 加 top-k gather 逻辑；`update_policy` 用预算 ref log-probs（回退路径仍支持实时 ref forward） |
 | `verl/workers/fsdp_workers.py` | 新增 `compute_kl_topk_indices`、`compute_ref_log_prob_topk` dispatch 方法 |
-| `verl/trainer/ppo/ray_trainer.py` | 训练循环 ref forward 之后插入 OEL 预算步骤（一次性预算 top-k indices + ref log-probs） |
+| `verl/trainer/ppo/ray_trainer.py` | 训练循环 ref forward 之后插入 OEL 预算步骤（一次性预算 top-k indices + ref log-probs，将 ref forward 从 K×M 次压缩为 1 次） |
 | `verl/trainer/config/actor/actor.yaml` | 新增 `topk_kl_k`、`topk_kl_mode`、`topk_kl_jsd_beta` 三个字段 |
 
 ---
@@ -197,7 +197,7 @@ def topk_analytic_kl(
 
 ### Patch 2：`verl/workers/actor/dp_actor.py`
 
-**共 3 处修改。**
+**共 5 处修改（OEL 预算架构）。**
 
 #### 修改 2-A：更新 import（文件顶部）
 
@@ -215,73 +215,135 @@ from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 
 ---
 
-#### 修改 2-B：`DataParallelPPOActor.__init__` 加 `ref_module` 参数
+#### 修改 2-B：`_forward_micro_batch` 加参数 + 末尾 top-k 逻辑
 
-**找到** `DataParallelPPOActor` 类的 `__init__` 方法（通常如下）：
+**找到** `_forward_micro_batch` 的方法定义行，**在参数列表末尾追加 2 个参数**：
+
 ```python
-def __init__(self, config, actor_module, actor_optimizer=None):
-    """When optimizer is None, it is Reference Policy"""
-    super().__init__(config)
-    self.actor_module = actor_module
-    self.actor_optimizer = actor_optimizer
+# 改前（典型形态）：
+def _forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False):
+
+# 改后：
+def _forward_micro_batch(
+    self,
+    micro_batch,
+    temperature,
+    calculate_entropy=False,
+    return_topk_indices=False,  # 新增：True 时只返回 top-k indices，不走 log_probs 路径
+    kl_topk_k=256,              # 新增：top-k 数量
+):
 ```
 
-**替换为**（只加了一个参数 `ref_module=None` 和一行赋值）：
+**找到** `_forward_micro_batch` 中的 `return outputs` 语句（即方法末尾），在其**正前方**插入以下代码块：
+
 ```python
-def __init__(self, config, actor_module, actor_optimizer=None, ref_module=None):
-    """When optimizer is None, it is Reference Policy"""
-    super().__init__(config)
-    self.actor_module = actor_module
-    self.actor_optimizer = actor_optimizer
-    self.ref_module = ref_module  # 用于 analytic_kl loss，非 analytic_kl 时始终为 None
-```
-
-> ⚠️ 注意：如果 0.6.1 的 `__init__` 里在 `self.actor_optimizer = ...` 之后还有
-> `role = "Ref" if actor_optimizer is None else "Actor"` 等行，**只在这两行之后加一行
-> `self.ref_module = ref_module`**，不要改动其他部分。
-
----
-
-#### 修改 2-C：`_forward_micro_batch` 返回 logits
-
-**找到** `_forward_micro_batch` 方法中的返回语句（大约如下）：
-```python
-outputs = {"log_probs": log_probs}
-if calculate_entropy:
-    outputs["entropys"] = entropy
-return outputs
-```
-
-**替换为**（在 `return outputs` 前插入 2 行）：
-```python
-outputs = {"log_probs": log_probs}
-if calculate_entropy:
-    outputs["entropys"] = entropy
-# 当使用 analytic_kl 时，额外返回 logits 供 KL 计算（仅非 fused kernel 路径有效）
+# analytic_kl top-k helpers（仅非 fused kernel 路径）
 if not self.use_fused_kernels and getattr(self.config, "kl_loss_type", "") == "analytic_kl":
-    outputs["logits"] = logits  # shape: (bsz, response_length, vocab_size)
+    if return_topk_indices:
+        # OEL 预算第一步：返回 student top-k indices 供 ref 侧 gather 使用
+        log_probs_full = torch.nn.functional.log_softmax(logits, dim=-1)
+        _, topk_idx = log_probs_full.topk(kl_topk_k, dim=-1)  # (B, L, k)
+        outputs["kl_topk_indices"] = topk_idx
+    elif "kl_topk_indices" in micro_batch:
+        # OEL 主路径（update_policy 阶段）：用预算好的 indices gather student log-probs
+        topk_idx = micro_batch["kl_topk_indices"].to(logits.device)
+        log_probs_full = torch.nn.functional.log_softmax(logits, dim=-1)
+        outputs["student_log_probs_topk"] = log_probs_full.gather(-1, topk_idx)  # (B, L, k)
+    else:
+        # 回退：full-vocab（k=0）或 indices 未预算时，保留完整 logits
+        outputs["logits"] = logits  # (B, L, V)
 return outputs
 ```
 
-> ⚠️ 注意：`logits` 变量在此处必须已定义。在 0.6.x 的非 fused kernel 路径中，
-> `logits = output.logits` 之后会做 `logits.div_(temperature)` 和 slice 操作，
-> 确认 `logits` 变量在你的版本中是否存在于同一作用域。
-> 如果不存在，你需要将 `output.logits` 截取 response 段后单独存储。
->
-> 典型代码形态（0.8.0.dev 版本）：
-> ```python
-> logits = output.logits                              # (bsz, seqlen, vocab)
-> logits.div_(temperature)
-> logits = logits[:, -response_length - 1 : -1, :]   # 截取 response 段
-> log_probs = logprobs_from_logits(logits, micro_batch["responses"])
-> ```
-> 如果你的 0.6.1 版本形态相同，直接加上述两行即可。
+> ⚠️ 注意：`logits` 变量在此处须已定义（通常是 `logits = output.logits[:, -response_length-1:-1, :]` 经 temperature 缩放后的结果）。
 
 ---
 
-#### 修改 2-D：`update_policy` 添加 `analytic_kl` 分支
+#### 修改 2-C：新增 `compute_kl_topk_indices` 方法
 
-**找到** `update_policy` 方法中处理 KL loss 的代码块（大约如下）：
+在 `DataParallelPPOActor` 类中新增以下方法（建议放在 `compute_log_prob` 方法之后）：
+
+```python
+def compute_kl_topk_indices(self, data):
+    """OEL 预算第一步：计算 student 对当前 batch 的 top-k token indices。
+
+    返回 dict，键 ``kl_topk_indices``，shape (B, response_length, k)，dtype int64。
+    """
+    self.actor_module.eval()
+    k = data.meta_info["kl_topk_k"]
+    micro_batch_size = data.meta_info["micro_batch_size"]
+    temperature = data.meta_info["temperature"]
+
+    select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
+    data = data.select(batch_keys=select_keys)
+    micro_batches = data.split(micro_batch_size)
+
+    idx_list = []
+    for micro_batch in micro_batches:
+        micro_batch = micro_batch.to(get_device_id())
+        model_inputs = {**micro_batch.batch}
+        with torch.no_grad():
+            outputs = self._forward_micro_batch(
+                model_inputs, temperature=temperature,
+                return_topk_indices=True, kl_topk_k=k,
+            )
+        idx_list.append(outputs["kl_topk_indices"])
+    return {"kl_topk_indices": torch.cat(idx_list, dim=0)}  # (B, L, k)
+```
+
+> ⚠️ 0.6.1 中 `get_device_id()` 可能写法不同（如直接写 `"cuda"`），对照同文件其他方法的写法即可。
+
+---
+
+#### 修改 2-D：新增 `compute_ref_log_prob_topk` 方法
+
+紧接 `compute_kl_topk_indices` 之后新增：
+
+```python
+def compute_ref_log_prob_topk(self, data):
+    """OEL 预算第二步：用 kl_topk_indices gather ref model log-probs。
+
+    期望 ``data.batch`` 中含有 ``kl_topk_indices``（由 2-C 步骤生成）。
+    返回 dict，键 ``ref_log_prob_topk``，shape (B, response_length, k)，dtype float32。
+    """
+    self.actor_module.eval()
+    micro_batch_size = data.meta_info["micro_batch_size"]
+    temperature = data.meta_info["temperature"]
+
+    select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "kl_topk_indices"]
+    data = data.select(batch_keys=select_keys)
+    micro_batches = data.split(micro_batch_size)
+
+    ref_lp_list = []
+    for micro_batch in micro_batches:
+        micro_batch = micro_batch.to(get_device_id())
+        model_inputs = {**micro_batch.batch}
+        with torch.no_grad():
+            # kl_topk_indices 在 model_inputs 中，_forward_micro_batch 会走 gather 路径
+            outputs = self._forward_micro_batch(model_inputs, temperature=temperature)
+        ref_lp_list.append(outputs["student_log_probs_topk"])
+    return {"ref_log_prob_topk": torch.cat(ref_lp_list, dim=0)}  # (B, L, k)
+```
+
+---
+
+#### 修改 2-E：`update_policy` 两处修改
+
+**第一处**：找到 `update_policy` 中的 `select_keys` 列表（含有 `"ref_log_prob"` 那段），在追加 `ref_log_prob` 之后**再追加** OEL tensors：
+
+```python
+if self.config.use_kl_loss:
+    select_keys.append("ref_log_prob")
+    # OEL 预算 tensors（analytic_kl 专用）
+    if getattr(self.config, "kl_loss_type", "") == "analytic_kl":
+        if "kl_topk_indices" in data.batch:
+            select_keys.append("kl_topk_indices")
+        if "ref_log_prob_topk" in data.batch:
+            select_keys.append("ref_log_prob_topk")
+```
+
+**第二处**：找到 `update_policy` 中处理 KL loss 的代码块（大约如下）：
+
 ```python
 if self.config.use_kl_loss:
     ref_log_prob = model_inputs["ref_log_prob"]
@@ -297,39 +359,43 @@ if self.config.use_kl_loss:
 ```
 
 **替换为**：
+
 ```python
 if self.config.use_kl_loss:
     if getattr(self.config, "kl_loss_type", "") == "analytic_kl":
-        # ── analytic_kl：需要完整词表 logits + ref model forward ──
-        assert self.ref_module is not None, (
-            "kl_loss_type='analytic_kl' 需要 ref_module 注入到 DataParallelPPOActor。\n"
-            "请确认 ActorRolloutRefWorker 中 _is_ref=True，并已完成 fsdp_workers.py 的 Patch 3。"
-        )
-        assert "logits" in outputs, (
-            "analytic_kl 需要 _forward_micro_batch 返回 logits，"
-            "请确认 use_fused_kernels=False 且已完成 dp_actor.py 的 Patch 2-C。"
-        )
-        k_val    = getattr(self.config, "topk_kl_k", 256) or None   # 0 → None → 全词表
-        kl_mode  = getattr(self.config, "topk_kl_mode", "reverse_kl")
-        jsd_beta = getattr(self.config, "topk_kl_jsd_beta", 0.5)
-        response_length = response_mask.shape[-1]
-
-        with torch.no_grad():
-            ref_out = self.ref_module(
-                input_ids=model_inputs["input_ids"],
-                attention_mask=model_inputs["attention_mask"],
-                position_ids=model_inputs.get("position_ids"),
-                use_cache=False,
+        k_val = getattr(self.config, "topk_kl_k", 256)
+        if k_val > 0 and "ref_log_prob_topk" in model_inputs:
+            # ── OEL 预算路径（推荐）：直接用预算好的 ref log-probs ──
+            stu_lp = outputs["student_log_probs_topk"]                     # (B, L, k)
+            ref_lp = model_inputs["ref_log_prob_topk"].to(stu_lp.device)   # (B, L, k)
+            stu_p  = stu_lp.exp()
+            kld    = (stu_p * (stu_lp - ref_lp)).sum(-1)                   # (B, L)
+        else:
+            # ── 回退路径：full-vocab（k=0）或未预算时，实时做 ref forward ──
+            assert self.ref_module is not None, (
+                "analytic_kl with k=0 requires ref_module injected into DataParallelPPOActor."
             )
-            # 截取 response 段，与 student logits 对齐（student logits 已在 _forward_micro_batch 中截取）
-            ref_logits = ref_out.logits[:, -response_length - 1 : -1, :]
-
-        kld = topk_analytic_kl(
-            outputs["logits"], ref_logits,
-            k=k_val, mode=kl_mode, jsd_beta=jsd_beta
-        )
+            assert "logits" in outputs, (
+                "analytic_kl fallback requires logits; ensure use_fused_kernels=False."
+            )
+            k_val_opt = k_val or None   # 0 → None → 全词表
+            kl_mode   = getattr(self.config, "topk_kl_mode", "reverse_kl")
+            jsd_beta  = getattr(self.config, "topk_kl_jsd_beta", 0.5)
+            response_length = response_mask.shape[-1]
+            with torch.no_grad():
+                ref_out = self.ref_module(
+                    input_ids=model_inputs["input_ids"],
+                    attention_mask=model_inputs["attention_mask"],
+                    position_ids=model_inputs.get("position_ids"),
+                    use_cache=False,
+                )
+                ref_logits = ref_out.logits[:, -response_length - 1 : -1, :]
+            kld = topk_analytic_kl(
+                outputs["logits"], ref_logits,
+                k=k_val_opt, mode=kl_mode, jsd_beta=jsd_beta,
+            )
     else:
-        # ── 原有逻辑不变 ──
+        # ── 原有 k1/k2/k3 路径不变 ──
         ref_log_prob = model_inputs["ref_log_prob"]
         kld = kl_penalty(
             logprob=log_prob, ref_logprob=ref_log_prob,
@@ -343,42 +409,89 @@ if self.config.use_kl_loss:
     micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
 ```
 
-> ⚠️ 注意：上述代码中的变量名（`outputs`、`response_mask`、`loss_agg_mode`、
-> `loss_scale_factor` 等）需要与你的 0.6.1 版本实际使用的变量名对齐。
-> 如果 0.6.1 中变量名不同（如 `micro_batch_outputs` 而非 `outputs`），请相应修改。
+> ⚠️ 注意：上述代码中的变量名（`outputs`、`model_inputs`、`response_mask`、`loss_agg_mode` 等）
+> 需与你的 0.6.1 版本实际使用的变量名对齐。
 
 ---
 
 ### Patch 3：`verl/workers/fsdp_workers.py`
 
-**只需添加 2 行。**
+**废弃旧实现（2 行 ref_module 注入），改为新增 2 个 dispatch 方法。**
 
-**找到** `_is_ref` 代码块中创建 `self.ref_policy` 的那一行（大约如下）：
+**找到** `ActorRolloutRefWorker` 中 `compute_ref_log_prob` 方法的末尾，在其**正后方**插入以下两个方法：
+
 ```python
-self.ref_policy = DataParallelPPOActor(
-    config=self.config.ref, actor_module=self.ref_module_fsdp
-)
+@register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+def compute_kl_topk_indices(self, data: DataProto) -> DataProto:
+    """OEL 预算第一步：计算 student top-k indices（由 actor_rollout_wg 调用）。"""
+    assert self._is_actor
+    data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
+    data.meta_info["max_token_len"]    = self.config.rollout.log_prob_max_token_len_per_gpu
+    data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
+    data.meta_info["temperature"]      = self.config.rollout.temperature
+    data.meta_info["kl_topk_k"]        = self.config.actor.topk_kl_k
+
+    with self.ulysses_sharding_manager:
+        result = self.actor.compute_kl_topk_indices(data=data)
+        output = DataProto.from_dict(tensors={"kl_topk_indices": result["kl_topk_indices"]})
+
+    return output.to("cpu")
+
+
+@register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+def compute_ref_log_prob_topk(self, data: DataProto) -> DataProto:
+    """OEL 预算第二步：gather ref log-probs at top-k positions（由 ref_policy_wg 调用）。"""
+    assert self._is_ref or self._is_lora
+    data.meta_info["micro_batch_size"] = self.config.ref.log_prob_micro_batch_size_per_gpu
+    data.meta_info["max_token_len"]    = self.config.ref.log_prob_max_token_len_per_gpu
+    data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
+    data.meta_info["temperature"]      = self.config.rollout.temperature
+
+    with self.ulysses_sharding_manager:
+        result = self.ref_policy.compute_ref_log_prob_topk(data=data)
+        output = DataProto.from_dict(tensors={"ref_log_prob_topk": result["ref_log_prob_topk"]})
+
+    return output.to("cpu")
 ```
 
-**在其正下方插入 2 行**（注意缩进与上方代码保持一致）：
-```python
-self.ref_policy = DataParallelPPOActor(
-    config=self.config.ref, actor_module=self.ref_module_fsdp
-)
-# 将 ref model 注入 actor，供 analytic_kl loss 使用
-# （ref model 在 _is_actor 之后才构建，因此在此处回填）
-if self._is_actor and getattr(self.config.actor, "kl_loss_type", "") == "analytic_kl":
-    self.actor.ref_module = self.ref_module_fsdp
-```
-
-> ⚠️ 注意：在 0.6.1 中，`self.ref_policy` 的构建可能在方法的不同位置。
-> 核心是找到 `self.ref_module_fsdp` 构建完成之后的位置插入上面两行。
-> `self.ref_module_fsdp` 通常通过 `self._build_model_optimizer(...)` 返回，
-> 确认它已赋值后再插入。
+> ⚠️ 注意：
+> - `@register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)` 是标准 dispatch 装饰器，与 `compute_ref_log_prob` 同级写法。
+> - `self.ulysses_sharding_manager` 在 0.6.1 中写法可能是 `with self.sharding_manager:` 或类似，对照原有 `compute_ref_log_prob` 方法写法即可。
+> - **LoRA 场景**（`_is_lora`）：`compute_ref_log_prob_topk` 需改为 `with self.actor.actor_module.disable_adapter():` 并调用 `self.actor.compute_ref_log_prob_topk`，参考同文件 LoRA 分支的 `compute_ref_log_prob` 写法。
 
 ---
 
-### Patch 4：`verl/trainer/config/actor/actor.yaml`
+### Patch 4：`verl/trainer/ppo/ray_trainer.py`
+
+**找到** `fit()` 训练循环中 ref log prob 计算之后（通常是 `batch = batch.union(ref_log_prob)` 的下一行），**插入**以下代码块：
+
+```python
+# OEL 预算：一次性预算 student top-k indices + ref gathered log-probs
+# 将 ref forward 从 update_policy 的 K×M 次压缩为训练循环里 1 次
+actor_cfg = self.config.actor_rollout_ref.actor
+if (
+    getattr(actor_cfg, "use_kl_loss", False)
+    and getattr(actor_cfg, "kl_loss_type", "") == "analytic_kl"
+    and getattr(actor_cfg, "topk_kl_k", 256) > 0
+    and self.use_reference_policy
+):
+    # Step 1: actor forward → student top-k indices (B, L, k)
+    topk_idx_proto = self.actor_rollout_wg.compute_kl_topk_indices(batch)
+    batch = batch.union(topk_idx_proto)
+    # Step 2: ref forward → gathered ref log-probs (B, L, k)
+    ref_topk_proto = self.ref_policy_wg.compute_ref_log_prob_topk(batch)
+    batch = batch.union(ref_topk_proto)
+```
+
+> ⚠️ 注意：
+> - `self.actor_rollout_wg` 和 `self.ref_policy_wg` 是 0.8.0.dev 的命名，0.6.1 中可能是 `self.actor_rollout_worker_group`、`self.ref_policy_worker_group` 或类似写法，对照原有 `compute_ref_log_prob` 的调用方写法即可。
+> - `batch.union(...)` 在 0.6.1 中如果 API 不同（如 `batch.update(...)` 或直接赋值），相应调整。
+> - 如果 0.6.1 无 `marked_timer`，直接去掉计时包装，保留内部 3 行代码即可。
+> - 确保此块位于 `update_actor(batch)` 调用之前。
+
+---
+
+### Patch 5：`verl/trainer/config/actor/actor.yaml`
 
 **找到**：
 ```yaml
