@@ -345,7 +345,9 @@ class DataParallelPPOActor(BasePPOActor):
             else:
                 # no-grad paths (compute_kl_topk_indices / compute_ref_log_prob_topk): save memory
                 with torch.no_grad():
-                    log_probs_full = logits.log_softmax_(dim=-1)  # in-place: reuse logits memory, avoid OOM
+                    # in-place log_softmax: x -= logsumexp(x) reuses logits storage, avoids OOM
+                    logits.sub_(torch.logsumexp(logits, dim=-1, keepdim=True))
+                    log_probs_full = logits  # logits now holds log-probs in-place
                     if kl_topk_indices is None:
                         _, topk_result = log_probs_full.topk(kl_topk_k, dim=-1)  # (B, L, k) int64
                     else:
@@ -623,14 +625,33 @@ class DataParallelPPOActor(BasePPOActor):
                         if getattr(self.config, "kl_loss_type", "") == "analytic_kl":
                             k_val = getattr(self.config, "topk_kl_k", 256)
                             if k_val > 0 and _stu_lp_topk is not None and "ref_log_prob_topk" in model_inputs:
-                                # OEL path: use pre-computed ref log-probs
-                                ref_lp = model_inputs["ref_log_prob_topk"].to(_stu_lp_topk.device)
-                                stu_p = _stu_lp_topk.exp()
-                                kld = (stu_p * (_stu_lp_topk - ref_lp)).sum(-1)  # (B, L)
+                                # OEL path: compute divergence from pre-gathered log-probs at student top-k positions.
+                                # NOTE: OEL always pre-computes student top-k indices.
+                                # - reverse_kl: exact top-k approximation (student top-k is optimal support).
+                                # - forward_kl/jsd/symmetric_kl: uses student top-k as support, which is an
+                                #   approximation (full correctness requires ref top-k or union). Acceptable
+                                #   because student top-k captures most probability mass.
+                                ref_lp = model_inputs["ref_log_prob_topk"].to(_stu_lp_topk.device)  # (B, L, k)
+                                stu_p = _stu_lp_topk.exp()   # (B, L, k)
+                                ref_p = ref_lp.exp()          # (B, L, k)
+                                mode = getattr(self.config, "topk_kl_mode", "reverse_kl")
+                                if mode == "reverse_kl":
+                                    kld = (stu_p * (_stu_lp_topk - ref_lp)).sum(-1)  # (B, L)
+                                elif mode == "forward_kl":
+                                    kld = (ref_p * (ref_lp - _stu_lp_topk)).sum(-1)  # (B, L)
+                                elif mode == "jsd":
+                                    beta = getattr(self.config, "topk_kl_jsd_beta", 0.5)
+                                    m = beta * ref_p + (1.0 - beta) * stu_p
+                                    log_m = m.clamp(min=1e-30).log()
+                                    kld = (beta * (ref_p * (ref_lp - log_m)) + (1.0 - beta) * (stu_p * (_stu_lp_topk - log_m))).sum(-1)
+                                elif mode == "symmetric_kl":
+                                    kld = 0.5 * ((ref_p * (ref_lp - _stu_lp_topk)) + (stu_p * (_stu_lp_topk - ref_lp))).sum(-1)
+                                else:
+                                    raise ValueError(f"Unknown topk_kl_mode: {mode!r}. Use reverse_kl/forward_kl/jsd/symmetric_kl.")
                             else:
                                 raise AssertionError(
                                     "analytic_kl requires pre-computed kl_topk_indices and ref_log_prob_topk "
-                                    "in batch. Ensure ray_trainer.py Patch 4 is applied and topk_kl_k > 0."
+                                    "in batch. Ensure ray_trainer.py OEL patch is applied and topk_kl_k > 0."
                                 )
                         else:
                             ref_log_prob = model_inputs["ref_log_prob"]
