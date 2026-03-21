@@ -331,14 +331,25 @@ class DataParallelPPOActor(BasePPOActor):
                 if not self.config.entropy_checkpointing:
                     entropy = verl_F.entropy_from_logits(logits)
                 else:
-                    entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
+                    # Clone before in-place log_softmax_ so checkpoint re-forward sees original logits
+                    entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits.clone())
 
-            with torch.no_grad():
-                log_probs_full = logits.log_softmax_(dim=-1)  # (B, L, V) in-place: reuse logits memory, avoid OOM
+            if torch.is_grad_enabled():
+                # update_policy path: need gradients through log_probs_full for KL loss backprop
+                log_probs_full = logits.log_softmax(dim=-1)  # non-in-place, retains autograd graph
                 if kl_topk_indices is None:
-                    _, topk_result = log_probs_full.topk(kl_topk_k, dim=-1)  # (B, L, k)
+                    with torch.no_grad():
+                        _, topk_result = log_probs_full.topk(kl_topk_k, dim=-1)  # (B, L, k) int64, no grad needed
                 else:
-                    topk_result = log_probs_full.gather(-1, kl_topk_indices.to(logits.device))  # (B, L, k)
+                    topk_result = log_probs_full.gather(-1, kl_topk_indices.to(logits.device))  # (B, L, k) float, has grad
+            else:
+                # no-grad paths (compute_kl_topk_indices / compute_ref_log_prob_topk): save memory
+                with torch.no_grad():
+                    log_probs_full = logits.log_softmax_(dim=-1)  # in-place: reuse logits memory, avoid OOM
+                    if kl_topk_indices is None:
+                        _, topk_result = log_probs_full.topk(kl_topk_k, dim=-1)  # (B, L, k) int64
+                    else:
+                        topk_result = log_probs_full.gather(-1, kl_topk_indices.to(logits.device))  # (B, L, k)
 
         return entropy, log_probs, topk_result
 

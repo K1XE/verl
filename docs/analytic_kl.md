@@ -368,9 +368,17 @@ OEL 架构将 ref forward 从 `update_policy` 里搬出来，变成训练步开�
 
 | 额外张量 | Shape | GPU 显存 @ B_micro=2,L=1024,k=256 |
 |---------|-------|-----------------------------------|
+| `log_probs_full`（`log_softmax` 结果） | (B_micro, L, V) bf16 | 与 logits 等大，**不额外分配**（autograd 复用） |
 | `student_log_probs_topk` | (B_micro, L, k) float32 | 2 × 1024 × 256 × 4 B ≈ **2 MB** |
 | `ref_log_prob_topk`（从 CPU 搬来） | (B_micro, L, k) float32 | ≈ **2 MB** |
-| **合计** | | ≈ **4 MB** |
+| **合计额外** | | ≈ **4 MB** |
+
+> **实现细节**：`update_policy` 路径使用非 in-place `log_softmax`（以保留梯度），因此 `log_probs_full` 是独立张量，
+> 与 `logits` 同时存在于 GPU 内存，峰值约为 logits 的 **2 倍**（例如 B_micro=2,L=1024,V=128K,bf16 ≈ **2 × 512 MB = 1 GB**）。
+> 但这与 k3 路径相同（k3 的 log_softmax 同样不释放 logits），并不产生额外开销。
+>
+> OEL 预算路径（`compute_kl_topk_indices` / `compute_ref_log_prob_topk`）使用 in-place `log_softmax_`，
+> 不额外分配 `(B,L,V)` 张量，峰值仍为单份 logits。
 
 结论：**与 k3 相比，OEL 路径几乎不增加 GPU 显存**（4 MB vs logits 动辄数 GB）。
 
