@@ -334,7 +334,7 @@ class DataParallelPPOActor(BasePPOActor):
                     entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
 
             with torch.no_grad():
-                log_probs_full = torch.nn.functional.log_softmax(logits, dim=-1)  # (B, L, V)
+                log_probs_full = logits.log_softmax_(dim=-1)  # (B, L, V) in-place: reuse logits memory, avoid OOM
                 if kl_topk_indices is None:
                     _, topk_result = log_probs_full.topk(kl_topk_k, dim=-1)  # (B, L, k)
                 else:
