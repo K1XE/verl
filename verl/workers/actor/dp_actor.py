@@ -394,30 +394,6 @@ class DataParallelPPOActor(BasePPOActor):
                 )
             ref_lp_list.append(ref_lp)
         return {"ref_log_prob_topk": torch.cat(ref_lp_list, dim=0)}  # (B, L, k)
-        assert self.config.grad_clip is not None
-        if self.scaler is not None:
-            self.scaler.unscale_(self.actor_optimizer)
-        if isinstance(self.actor_module, FSDP):
-            grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
-        elif isinstance(self.actor_module, FSDPModule):
-            grad_norm = fsdp2_clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
-        else:
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
-
-        if isinstance(grad_norm, DTensor):
-            grad_norm = grad_norm.full_tensor()
-
-        # if grad_norm is not finite, skip the update
-        if self.scaler is not None:
-            self.scaler.step(self.actor_optimizer)
-            self.scaler.update()
-        else:
-            if not torch.isfinite(grad_norm):
-                print(f"WARN: rank {torch.distributed.get_rank()} grad_norm is not finite: {grad_norm}")
-                self.actor_optimizer.zero_grad()
-            else:
-                self.actor_optimizer.step()
-        return grad_norm
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def compute_log_prob(self, data: DataProto, calculate_entropy=False) -> torch.Tensor:
