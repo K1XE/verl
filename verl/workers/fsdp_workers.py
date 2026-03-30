@@ -967,6 +967,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         is_lora = data.meta_info.pop("is_lora", False)
         adapter_ctx = self.actor.actor_module.disable_adapter() if is_lora else nullcontext()
+        dump_request = data.meta_info.get("vocab_logits_dump")
+        if dump_request is not None:
+            dump_request = dict(dump_request)
+            dump_request.setdefault("role", "actor")
         # we should always recompute old_log_probs when it is HybridEngine
         data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
         data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
@@ -975,9 +979,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
             with adapter_ctx:
-                output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+                output, entropys, dump_records = self.actor.compute_log_prob(
+                    data=data,
+                    calculate_entropy=True,
+                    raw_logits_dump_request=dump_request,
+                )
             output = DataProto.from_dict(
                 tensors={"old_log_probs": output, "entropys": entropys},
+                non_tensors={
+                    "vocab_logits_dump_records": np.array(dump_records, dtype=object)
+                }
+                if dump_records
+                else None,
                 meta_info={"temperature": self.config.rollout.temperature},
             )
 
@@ -997,12 +1010,25 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
     def compute_ref_log_prob(self, data: DataProto):
+        dump_request = data.meta_info.get("vocab_logits_dump")
+        if dump_request is not None:
+            dump_request = dict(dump_request)
+            dump_request["role"] = "ref"
         if self._is_lora:
             # if _is_lora, actor without lora applied is the ref
             data.meta_info["is_lora"] = True
+            if dump_request is not None:
+                data.meta_info["vocab_logits_dump"] = dump_request
             data = self.compute_log_prob(data)
             # this old_log_probs is in fact ref_log_prob
-            data = DataProto.from_dict(tensors={"ref_log_prob": data.batch["old_log_probs"]})
+            data = DataProto.from_dict(
+                tensors={"ref_log_prob": data.batch["old_log_probs"]},
+                non_tensors={
+                    "vocab_logits_dump_records": data.non_tensor_batch["vocab_logits_dump_records"]
+                }
+                if "vocab_logits_dump_records" in data.non_tensor_batch
+                else None,
+            )
             return data
         assert self._is_ref
         # else:
@@ -1015,8 +1041,19 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on ref.compute_log_prob
-            output, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
-            output = DataProto.from_dict(tensors={"ref_log_prob": output})
+            output, _, dump_records = self.ref_policy.compute_log_prob(
+                data=data,
+                calculate_entropy=False,
+                raw_logits_dump_request=dump_request,
+            )
+            output = DataProto.from_dict(
+                tensors={"ref_log_prob": output},
+                non_tensors={
+                    "vocab_logits_dump_records": np.array(dump_records, dtype=object)
+                }
+                if dump_records
+                else None,
+            )
 
         output = output.to("cpu")
 
@@ -1084,6 +1121,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
         from verl.utils.logger import log_with_rank
 
         # only support save and load ckpt for actor

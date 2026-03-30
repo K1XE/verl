@@ -19,6 +19,10 @@ Single Process Actor
 
 import logging
 import os
+import time
+from itertools import chain
+from pathlib import Path
+from typing import Any
 
 import torch
 from torch import nn
@@ -29,11 +33,11 @@ import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty, topk_analytic_kl
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
-from verl.utils.device import get_device_id, get_device_name
+from verl.utils.device import get_device_id, get_device_name, get_torch_device
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.py_functional import append_to_dict
-from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
+from verl.utils.seqlen_balancing import get_reverse_idx, prepare_dynamic_batch, restore_dynamic_batch
 from verl.utils.torch_dtypes import PrecisionType
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
@@ -91,15 +95,169 @@ class DataParallelPPOActor(BasePPOActor):
         else:
             self.scaler = None
 
+    @staticmethod
+    def _resolve_dump_dtype(dtype_name: str) -> torch.dtype:
+        normalized = str(dtype_name).lower()
+        if normalized == "float16":
+            return torch.float16
+        if normalized == "bfloat16":
+            return torch.bfloat16
+        if normalized == "float32":
+            return torch.float32
+        raise ValueError(f"Unsupported raw logits dump dtype: {dtype_name}")
+
+    @staticmethod
+    def _extract_uids(micro_batch: dict[str, Any]) -> list[str] | None:
+        if "uid" not in micro_batch:
+            return None
+        raw_uids = micro_batch["uid"]
+        if hasattr(raw_uids, "tolist"):
+            raw_uids = raw_uids.tolist()
+        return [str(uid) for uid in raw_uids]
+
+    @staticmethod
+    def _compute_response_flat_positions(attention_mask: torch.Tensor, response_length: int) -> torch.Tensor:
+        batch_size, seqlen = attention_mask.shape
+        prompt_length = seqlen - response_length
+        valid_lengths = attention_mask.sum(dim=-1).to(dtype=torch.long)
+        flat_positions = []
+        for batch_idx in range(batch_size):
+            valid_length = int(valid_lengths[batch_idx].item())
+            start = prompt_length - 1
+            end = valid_length - 1
+            if end <= start:
+                continue
+            local_positions = torch.arange(start, end, device=attention_mask.device, dtype=torch.long)
+            flat_positions.append(batch_idx * seqlen + local_positions)
+        if not flat_positions:
+            return torch.empty(0, device=attention_mask.device, dtype=torch.long)
+        return torch.cat(flat_positions, dim=0)
+
+    def _save_raw_logits_dump(
+        self,
+        *,
+        logits: torch.Tensor,
+        micro_batch: dict[str, Any],
+        dump_request: dict[str, Any] | None,
+        micro_batch_index: int,
+        storage_format: str,
+        flat_token_positions: torch.Tensor | None = None,
+    ) -> list[dict[str, Any]] | None:
+        if dump_request is None:
+            return None
+        if self.use_fused_kernels:
+            raise ValueError("Raw logits dump is not supported with use_fused_kernels=True")
+
+        input_ids = micro_batch["input_ids"]
+        attention_mask = micro_batch["attention_mask"]
+        responses = micro_batch["responses"]
+        position_ids = micro_batch["position_ids"]
+        batch_size, seqlen = input_ids.shape
+        response_length = responses.shape[-1]
+
+        role = str(dump_request["role"])
+        step = int(dump_request["step"])
+        position_scope = str(dump_request["position_scope"])
+        target_dtype = self._resolve_dump_dtype(dump_request["dtype"])
+        rank = torch.distributed.get_rank()
+
+        step_dir = Path(dump_request["path"]).expanduser() / f"step_{step:07d}" / role
+        step_dir.mkdir(parents=True, exist_ok=True)
+        file_path = step_dir / f"{role}_rank{rank:05d}_micro{micro_batch_index:04d}.pt"
+
+        if storage_format == "dense":
+            logits_to_save = logits[:, -response_length - 1 : -1, :] if position_scope == "response_only" else logits
+            payload_flat_positions = None
+        elif storage_format == "rmpad_ragged":
+            if flat_token_positions is None:
+                raise ValueError("flat_token_positions is required for rmpad raw logits dumps")
+            if position_scope == "response_only":
+                response_flat_positions = self._compute_response_flat_positions(attention_mask, response_length)
+                selection_mask = torch.isin(flat_token_positions, response_flat_positions)
+                logits_to_save = logits[selection_mask]
+                payload_flat_positions = flat_token_positions[selection_mask]
+            else:
+                logits_to_save = logits
+                payload_flat_positions = flat_token_positions
+        else:
+            raise ValueError(f"Unsupported raw logits dump storage format: {storage_format}")
+
+        copy_start = time.perf_counter()
+        cpu_logits = logits_to_save.detach().to(device="cpu", dtype=target_dtype)
+        get_torch_device().synchronize()
+        input_ids_cpu = input_ids.detach().to(device="cpu")
+        attention_mask_cpu = attention_mask.detach().to(device="cpu")
+        responses_cpu = responses.detach().to(device="cpu")
+        position_ids_cpu = position_ids.detach().to(device="cpu")
+        response_mask_cpu = attention_mask[:, -response_length:].detach().to(device="cpu")
+        flat_token_positions_cpu = None
+        if payload_flat_positions is not None:
+            flat_token_positions_cpu = payload_flat_positions.detach().to(device="cpu")
+        copy_time_s = time.perf_counter() - copy_start
+
+        payload = {
+            "schema_version": 1,
+            "role": role,
+            "step": step,
+            "rank": rank,
+            "micro_batch_index": micro_batch_index,
+            "position_scope": position_scope,
+            "storage_format": storage_format,
+            "saved_dtype": str(dump_request["dtype"]).lower(),
+            "temperature": float(dump_request["temperature"]),
+            "sequence_shape": [batch_size, seqlen],
+            "response_length": int(response_length),
+            "input_ids": input_ids_cpu,
+            "attention_mask": attention_mask_cpu,
+            "responses": responses_cpu,
+            "response_mask": response_mask_cpu,
+            "position_ids": position_ids_cpu,
+            "logits": cpu_logits,
+            "uids": self._extract_uids(micro_batch),
+        }
+        if flat_token_positions_cpu is not None:
+            payload["flat_token_positions"] = flat_token_positions_cpu
+
+        write_start = time.perf_counter()
+        torch.save(payload, file_path)
+        write_time_s = time.perf_counter() - write_start
+
+        record = {
+            "role": role,
+            "path": str(file_path),
+            "step": step,
+            "rank": rank,
+            "micro_batch_index": micro_batch_index,
+            "storage_format": storage_format,
+            "position_scope": position_scope,
+            "dtype": str(dump_request["dtype"]).lower(),
+            "batch_size": batch_size,
+            "sequence_length": seqlen,
+            "response_length": int(response_length),
+            "num_positions": int(cpu_logits.shape[0] if cpu_logits.dim() == 2 else cpu_logits.shape[0] * cpu_logits.shape[1]),
+            "vocab_size": int(cpu_logits.shape[-1]) if cpu_logits.numel() > 0 else 0,
+            "bytes_on_disk": file_path.stat().st_size,
+            "copy_time_s": copy_time_s,
+            "write_time_s": write_time_s,
+        }
+        return [record] * batch_size
+
     def _forward_micro_batch(
-        self, micro_batch, temperature, calculate_entropy=False
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self,
+        micro_batch,
+        temperature,
+        calculate_entropy=False,
+        raw_logits_dump_request: dict[str, Any] | None = None,
+        micro_batch_index: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, Any]] | None]:
         """
         Returns:
             entropy: # (bs, response_len)
             log_probs: # (bs, response_len)
         """
         response_length = micro_batch["responses"].size(-1)
+        if raw_logits_dump_request is not None and self.use_fused_kernels:
+            raise ValueError("Raw logits dump is not supported with use_fused_kernels=True")
         multi_modal_inputs = {}
         if "multi_modal_inputs" in micro_batch.keys():
             from verl.utils.model import extract_multi_modal_inputs
@@ -112,6 +270,7 @@ class DataParallelPPOActor(BasePPOActor):
             attention_mask = micro_batch["attention_mask"]
             position_ids = micro_batch["position_ids"]
             entropy = None
+            dump_records = None
             if position_ids.dim() == 3:  # qwen2vl mrope
                 position_ids = position_ids.transpose(0, 1)  # (bsz, 4, seqlen) -> (4, bsz, seqlen)
 
@@ -190,6 +349,23 @@ class DataParallelPPOActor(BasePPOActor):
 
                 else:
                     logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
+                    if raw_logits_dump_request is not None:
+                        dump_logits_rmpad = logits_rmpad
+                        if self.use_ulysses_sp:
+                            dump_logits_rmpad = gather_outputs_and_unpad(
+                                dump_logits_rmpad,
+                                gather_dim=0,
+                                unpad_dim=0,
+                                padding_size=pad_size,
+                            )
+                        dump_records = self._save_raw_logits_dump(
+                            logits=dump_logits_rmpad,
+                            micro_batch=micro_batch,
+                            dump_request=raw_logits_dump_request,
+                            micro_batch_index=micro_batch_index,
+                            storage_format="rmpad_ragged",
+                            flat_token_positions=indices,
+                        )
                     logits_rmpad.div_(temperature)
 
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
@@ -268,6 +444,14 @@ class DataParallelPPOActor(BasePPOActor):
 
                 else:
                     logits = output.logits
+                    if raw_logits_dump_request is not None:
+                        dump_records = self._save_raw_logits_dump(
+                            logits=logits,
+                            micro_batch=micro_batch,
+                            dump_request=raw_logits_dump_request,
+                            micro_batch_index=micro_batch_index,
+                            storage_format="dense",
+                        )
 
                     logits.div_(temperature)
                     logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
@@ -278,7 +462,7 @@ class DataParallelPPOActor(BasePPOActor):
                         else:
                             entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
 
-            return entropy, log_probs
+            return entropy, log_probs, dump_records
 
     def _forward_micro_batch_with_topk(
         self,
@@ -409,7 +593,12 @@ class DataParallelPPOActor(BasePPOActor):
         return {"ref_log_prob_topk": torch.cat(ref_lp_list, dim=0)}  # (B, L, k)
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
-    def compute_log_prob(self, data: DataProto, calculate_entropy=False) -> torch.Tensor:
+    def compute_log_prob(
+        self,
+        data: DataProto,
+        calculate_entropy=False,
+        raw_logits_dump_request: dict[str, Any] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, list[dict[str, Any]]]:
         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
 
         Args:
@@ -436,6 +625,8 @@ class DataParallelPPOActor(BasePPOActor):
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
+        if raw_logits_dump_request is not None and "uid" in data.non_tensor_batch.keys():
+            non_tensor_select_keys.append("uid")
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
@@ -447,16 +638,23 @@ class DataParallelPPOActor(BasePPOActor):
 
         log_probs_lst = []
         entropy_lst = []
-        for micro_batch in micro_batches:
+        dump_records_lst = []
+        for micro_batch_index, micro_batch in enumerate(micro_batches):
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
-                entropy, log_probs = self._forward_micro_batch(
-                    model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                entropy, log_probs, dump_records = self._forward_micro_batch(
+                    model_inputs,
+                    temperature=temperature,
+                    calculate_entropy=calculate_entropy,
+                    raw_logits_dump_request=raw_logits_dump_request,
+                    micro_batch_index=micro_batch_index,
                 )
             log_probs_lst.append(log_probs)
             if calculate_entropy:
                 entropy_lst.append(entropy)
+            if dump_records is not None:
+                dump_records_lst.extend(dump_records)
 
         log_probs = torch.concat(log_probs_lst, dim=0)
         entropys = None
@@ -467,8 +665,11 @@ class DataParallelPPOActor(BasePPOActor):
             log_probs = restore_dynamic_batch(log_probs, batch_idx_list)
             if calculate_entropy:
                 entropys = restore_dynamic_batch(entropys, batch_idx_list)
+            if dump_records_lst:
+                revert_indices = get_reverse_idx(list(chain.from_iterable(batch_idx_list)))
+                dump_records_lst = [dump_records_lst[idx] for idx in revert_indices]
 
-        return log_probs, entropys
+        return log_probs, entropys, dump_records_lst
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
